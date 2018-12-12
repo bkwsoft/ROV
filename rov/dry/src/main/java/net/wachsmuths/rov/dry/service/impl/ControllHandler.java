@@ -39,6 +39,7 @@ public class ControllHandler implements Closeable {
   }
   
   public Response sendCommand(Command command) throws IOException, ClassNotFoundException {
+    log.debug("Sending command: " + command.getClass().getSimpleName());
     out.writeObject(command);
     out.flush();
     

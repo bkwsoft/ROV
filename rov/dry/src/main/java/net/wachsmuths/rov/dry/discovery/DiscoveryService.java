@@ -6,10 +6,11 @@ package net.wachsmuths.rov.dry.discovery;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.InetAddress;
+import java.net.SocketTimeoutException;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import org.apache.commons.io.IOUtils;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
@@ -23,7 +24,7 @@ import net.wachsmuths.rov.common.RovConstants;
  */
 @Service
 @Slf4j
-public class DiscoveryService {
+public class DiscoveryService implements DisposableBean {
   private ExecutorService executorService;
   private DiscoveryListener listener;
   private ApplicationEventPublisher eventPublisher;
@@ -34,20 +35,32 @@ public class DiscoveryService {
   }
 
   @EventListener
-  public void handleEvent(ApplicationReadyEvent event) {
-    log.debug("Starting Discovery Service");
+  public void performStart(ApplicationReadyEvent event) {
     startService();
   }
 
+  @Override
+  public void destroy() {
+    stopService();
+  }
+  
   private void startService() {
+    log.debug("Starting Discovery Service");
     synchronized (this) {
       listener = new DiscoveryListener();
       executorService.execute(listener);
     }
   }
   
+  private void stopService() {
+    log.debug("Stopping Discovery Service");
+    listener.stop();
+  }
+  
   private class DiscoveryListener implements Runnable {
     private static final long SLEEP_TIME = 1000;
+    private static final int SOCKET_READ_TIMEOUT = 100;
+    private volatile boolean running = true;
 
     @Override
     public void run() {
@@ -55,17 +68,23 @@ public class DiscoveryService {
       
       try {
         socketIn = new DatagramSocket(RovConstants.DISCOVERY_BCAST_PORT);
+        socketIn.setSoTimeout(SOCKET_READ_TIMEOUT);
 
-        while (true) {
+        while (running) {
           DatagramPacket data = new DatagramPacket(new byte[RovConstants.DISCOVERY_PACKET_SIZE], RovConstants.DISCOVERY_PACKET_SIZE);
-          socketIn.receive(data);
           
-          log.debug("Received beacon packet: " + new String(data.getData(), RovConstants.CHARSET));
-          
-          if (Arrays.equals(data.getData(), RovConstants.DISCOVERY_BYTES)) {
-            //We found a controller!
-            eventPublisher.publishEvent(new VehicleDiscoveryEvent(this, data.getAddress()));
-            log.debug("Setting vehicle address to " + data.getAddress().toString());
+          try {
+            socketIn.receive(data);
+            
+            log.debug("Received beacon packet: " + new String(data.getData(), RovConstants.CHARSET));
+            
+            if (Arrays.equals(data.getData(), RovConstants.DISCOVERY_BYTES)) {
+              //We found a controller!
+              eventPublisher.publishEvent(new VehicleDiscoveryEvent(this, data.getAddress()));
+              log.debug("Setting vehicle address to " + data.getAddress().toString());
+            }
+          } catch (SocketTimeoutException e) {
+            //Do nothing and let's move on...
           }
 
           try {
@@ -81,6 +100,12 @@ public class DiscoveryService {
           IOUtils.closeQuietly(socketIn);
         }
       }
+      
+      log.debug("Discovery Service Stopped.");
+    }
+    
+    public void stop() {
+      running = false;
     }
   }
 }

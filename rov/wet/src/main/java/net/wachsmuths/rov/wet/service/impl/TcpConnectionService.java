@@ -9,7 +9,12 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import org.apache.commons.io.IOUtils;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
@@ -25,8 +30,9 @@ import net.wachsmuths.rov.wet.service.CommandProcessorService;
  */
 @Service
 @Slf4j
-public class TcpConnectionService {
+public class TcpConnectionService implements DisposableBean {
   public static final long IDLE_TIME = 1000;  //One second
+  public static final int SOCKET_TIMEOUT = 100;
   
   private CommandProcessorService commandProcessorService;
   private ConnectionServer connectionServer;
@@ -43,27 +49,40 @@ public class TcpConnectionService {
     log.debug("Starting TcpConnectionService server.");
     connectionServer.start();
   }
-
   
+  @Override
+  public void destroy() throws Exception {
+    connectionServer.abort();
+  }
+
   private class ConnectionServer extends Thread {
     private ServerSocket listener;
+    private volatile boolean running = true;
+    private List<ConnectionHandler> handlers = new ArrayList<>();
 
     @Override
     public void run() {
       try {
-        this.listener = new ServerSocket(RovConstants.ROV_PORT);
+        listener = new ServerSocket(RovConstants.ROV_PORT);
+        listener.setSoTimeout(SOCKET_TIMEOUT);
       } catch (IOException e) {
         log.error("Failed to start connection server.", e);
         return;
       }
       
-      while (true) {
+      while (running) {
         try {
-          new ConnectionHandler(listener.accept()).start();
+          ConnectionHandler handler = new ConnectionHandler(listener.accept());
+          handlers.add(handler);
+          handler.start();
           eventPublisher.publishEvent(new ControllerConnectedEvent(this));
+        } catch (SocketTimeoutException e) {
+          //Do nothing and move on
         } catch (IOException e) {
           log.error("Error starting a new connection.", e);
         }
+        
+        cleanupHandlers();
         
         try {
           sleep(IDLE_TIME);
@@ -72,9 +91,32 @@ public class TcpConnectionService {
         }
       }
     }
+    
+    public void abort() {
+      running = false;
+      
+      Iterator<ConnectionHandler> it = handlers.iterator();
+      while (it.hasNext()) {
+        ConnectionHandler handler = it.next();
+        handler.abort();
+        it.remove();
+      }
+    }
+    
+    private void cleanupHandlers() {
+      Iterator<ConnectionHandler> it = handlers.iterator();
+      while (it.hasNext()) {
+        ConnectionHandler handler = it.next();
+        
+        if (!handler.isConnected()) {
+          it.remove();
+        }
+      }
+    }
   }
   
   private class ConnectionHandler extends Thread {
+    private boolean running = true;
     private Socket socket;
     private ObjectOutputStream out;
     private ObjectInputStream in;
@@ -82,16 +124,19 @@ public class TcpConnectionService {
     public ConnectionHandler(Socket clientSocket) throws IOException {
       log.debug("Received new connection from client: " + clientSocket.getInetAddress());
       this.socket = clientSocket;
+      this.socket.setSoTimeout(SOCKET_TIMEOUT);
       this.out = new ObjectOutputStream(clientSocket.getOutputStream());
       this.in= new ObjectInputStream(clientSocket.getInputStream());
     }
 
     @Override
     public void run() {
-      while (socket.isConnected()) {
+      while (socket.isConnected() && running) {
         try {
           Command command = (Command) in.readObject();
           out.writeObject(commandProcessorService.handleCommand(command));
+        } catch (SocketTimeoutException e) {
+          //Do nothing and move on to try reading again.
         } catch (EOFException e) {
           //Out channel has closed.  Break out of the loop.
           eventPublisher.publishEvent(new ControllerDisconnectedEvent(this));
@@ -110,6 +155,16 @@ public class TcpConnectionService {
       IOUtils.closeQuietly(in);
       IOUtils.closeQuietly(out);
       IOUtils.closeQuietly(socket);
+      
+      log.debug("Controller " + socket.getInetAddress() + " disconnected.");
+    }
+    
+    public void abort() {
+      running = false;
+    }
+    
+    public boolean isConnected() {
+      return (socket != null && socket.isConnected());
     }
   }
 }
